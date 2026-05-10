@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Google service account key — never commit
+service-account.json
+*-service-account.json

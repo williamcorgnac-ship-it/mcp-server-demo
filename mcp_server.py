@@ -1,40 +1,67 @@
 import os
 import re
 from datetime import date
+
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaInMemoryUpload
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("second-brain-server")
 
-BRAIN_ROOT = os.environ.get("BRAIN_ROOT", os.path.expanduser("~/@Cerveau"))
-INBOX = os.path.join(BRAIN_ROOT, "05-inputs", "a-traiter")
-SEARCH_DIRS = [
-    os.path.join(BRAIN_ROOT, "05-inputs"),
-    os.path.join(BRAIN_ROOT, "03-veille"),
-    os.path.join(BRAIN_ROOT, "04-reflexion"),
-    os.path.join(BRAIN_ROOT, "02-account-sg"),
-    os.path.join(BRAIN_ROOT, "07-toolkit"),
-]
+SCOPES = ["https://www.googleapis.com/auth/drive"]
+SA_FILE = os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE", "service-account.json")
+
+# Google Drive folder IDs for @Cerveau — share each with the service account email
+FOLDER_IDS = {
+    "inbox":         "18_er-3axcXsx63nwslYdOlmUvS-8f9dF",  # 05-inputs/a-traiter
+    "03-veille":     "1oOkU8zbmNtFAQH4VrJ0k1yAC__sxdkwo",
+    "04-reflexion":  "1vWCfaa36PCveKcaWIPORc26u4fWiLCZT",
+    "02-account-sg": "1conmnIN4Vq11KOdOcS1oHCzraWc-OC37",
+    "07-toolkit":    "1AbL0qDYzcUGW2upHLR30x_xhs8Y2Rmeq",
+}
+
+_drive_service = None
+
+
+def _drive():
+    global _drive_service
+    if _drive_service is None:
+        creds = service_account.Credentials.from_service_account_file(SA_FILE, scopes=SCOPES)
+        _drive_service = build("drive", "v3", credentials=creds)
+    return _drive_service
 
 
 @mcp.tool()
 def capture_note(note: str) -> dict:
     """
-    Capture an idea, observation, or note and save it as a dated file in the inbox.
+    Capture an idea, observation, or note and save it as a dated file in the inbox (05-inputs/a-traiter/).
     Use this when the input starts with '>'.
     """
-    os.makedirs(INBOX, exist_ok=True)
     today = date.today().isoformat()
-    existing = [f for f in os.listdir(INBOX) if f.startswith(today)]
-    index = len(existing) + 1
+    service = _drive()
+
+    existing = service.files().list(
+        q=f"'{FOLDER_IDS['inbox']}' in parents and name contains '{today}' and trashed=false",
+        fields="files(id)",
+    ).execute()
+    index = len(existing.get("files", [])) + 1
+
     filename = f"{today}-{index:02d}.md"
-    filepath = os.path.join(INBOX, filename)
     content = f"---\ndate: {today}\n---\n\n{note.strip()}\n"
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write(content)
+
+    media = MediaInMemoryUpload(content.encode("utf-8"), mimetype="text/plain", resumable=False)
+    created = service.files().create(
+        body={"name": filename, "parents": [FOLDER_IDS["inbox"]]},
+        media_body=media,
+        fields="id,name,webViewLink",
+    ).execute()
+
     return {
         "status": "captured",
-        "file": filename,
-        "path": f"05-inputs/a-traiter/{filename}",
+        "file": created["name"],
+        "path": f"05-inputs/a-traiter/{created['name']}",
+        "link": created.get("webViewLink", ""),
         "preview": note.strip()[:120],
     }
 
@@ -43,48 +70,45 @@ def capture_note(note: str) -> dict:
 def search_brain(query: str) -> dict:
     """
     Search the second brain for information matching the query.
-    Use this when the input starts with '?'. Returns a summary and the exact locations of matches.
+    Use this when the input starts with '?'. Returns a summary and exact file locations.
+    Note: only searches direct children of each brain folder (not recursive sub-folders).
     """
-    keywords = [w.lower() for w in re.split(r"\s+", query.strip()) if len(w) > 2]
+    keywords = [w for w in re.split(r"\s+", query.strip()) if len(w) > 2]
+    if not keywords:
+        return {"query": query, "results": [], "summary": "Requête trop courte."}
+
+    service = _drive()
+
+    folder_filter = " or ".join(f"'{fid}' in parents" for fid in FOLDER_IDS.values())
+    # Drive API fullText search supports AND logic; cap at 3 terms to stay under query limits
+    text_filter = " and ".join(f"fullText contains '{kw}'" for kw in keywords[:3])
+    q = f"({folder_filter}) and ({text_filter}) and trashed=false"
+
+    results = service.files().list(
+        q=q,
+        fields="files(id,name,parents,webViewLink,modifiedTime)",
+        orderBy="modifiedTime desc",
+        pageSize=5,
+    ).execute()
+
+    id_to_folder = {v: k for k, v in FOLDER_IDS.items()}
     matches = []
+    for f in results.get("files", []):
+        parent_id = (f.get("parents") or [None])[0]
+        matches.append({
+            "file": f["name"],
+            "folder": id_to_folder.get(parent_id, "unknown"),
+            "link": f.get("webViewLink", ""),
+            "modified": (f.get("modifiedTime") or "")[:10],
+        })
 
-    for search_dir in SEARCH_DIRS:
-        if not os.path.isdir(search_dir):
-            continue
-        for root, _, files in os.walk(search_dir):
-            for fname in files:
-                if not fname.endswith(".md"):
-                    continue
-                fpath = os.path.join(root, fname)
-                try:
-                    text = open(fpath, encoding="utf-8").read()
-                except OSError:
-                    continue
-                lower_text = text.lower()
-                hits = sum(1 for kw in keywords if kw in lower_text)
-                if hits == 0:
-                    continue
-                # Extract first matching line as excerpt
-                excerpt = next(
-                    (line.strip() for line in text.splitlines()
-                     if any(kw in line.lower() for kw in keywords) and line.strip()),
-                    ""
-                )
-                rel_path = os.path.relpath(fpath, BRAIN_ROOT)
-                matches.append({"file": rel_path, "score": hits, "excerpt": excerpt[:200]})
-
-    matches.sort(key=lambda m: m["score"], reverse=True)
-    top = matches[:5]
-
-    if not top:
+    if not matches:
         return {"query": query, "results": [], "summary": "Aucun résultat trouvé."}
 
-    summary_lines = [f"- {m['file']}: {m['excerpt']}" for m in top]
-    return {
-        "query": query,
-        "results": top,
-        "summary": "\n".join(summary_lines),
-    }
+    summary = "\n".join(
+        f"- [{m['file']}]({m['link']}) ({m['folder']}, {m['modified']})" for m in matches
+    )
+    return {"query": query, "results": matches, "summary": summary}
 
 
 @mcp.resource("brain://structure")
@@ -104,8 +128,8 @@ def brain_structure() -> str:
 def mobile_session_start() -> str:
     """Startup prompt for mobile second brain sessions."""
     return (
-        "Tu es mon assistant second cerveau. Mes fichiers sont dans le dossier @Cerveau "
-        "avec cette structure :\n"
+        "Tu es mon assistant second cerveau. Mes fichiers sont sur Google Drive "
+        "dans le dossier @Cerveau avec cette structure :\n"
         "  - 05-inputs/a-traiter/ → inbox (captures)\n"
         "  - 03-veille/ → signaux et synthèses de veille\n"
         "  - 04-reflexion/ → frameworks et synthèses hebdo\n"
